@@ -82,7 +82,6 @@ class TraceCommand extends Command
                 $file->getPath() . DIRECTORY_SEPARATOR . $file->getBasename('.php')
             );
         }, $this->files->allFiles($dir));
-
     }
 
     private function loadModel(string $class)
@@ -214,5 +213,4 @@ class TraceCommand extends Command
 
         return $mappings[$type] ?? 'string';
     }
-
 }
