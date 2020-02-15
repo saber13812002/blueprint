@@ -4,7 +4,9 @@ namespace Blueprint\Commands;
 
 use Blueprint\Blueprint;
 use Illuminate\Console\Command;
+use Illuminate\Database\Eloquent\Model;
 use Illuminate\Filesystem\Filesystem;
+use Illuminate\Support\Str;
 
 class TraceCommand extends Command
 {
@@ -47,20 +49,33 @@ class TraceCommand extends Command
         foreach ($this->appClasses() as $class) {
             $model = $this->loadModel($class);
             if (is_null($model)) {
-                // TODO: output warning
                 continue;
             }
 
-            $definitions[class_basename($model)] = $this->mapColumns($this->extractColumns($model));
+            $definitions[class_basename($model)] = $this->translateColumns($this->mapColumns($this->extractColumns($model)));
         }
 
-        // TODO: output YAML
-//        $this->files->get('.blueprint');
-//
+        if (empty($definitions)) {
+            $this->error('Model could not be resolved: ' . $class);
+
+            return;
+        }
+
         $blueprint = new Blueprint();
-        $yaml = $blueprint->dump(['models' => $definitions]);
-        echo $yaml, PHP_EOL;
-//        print_r($blueprint->parse($yaml));
+
+        $cache = [];
+        if ($this->files->exists('.blueprint')) {
+            $cache = $blueprint->parse($this->files->get('.blueprint'));
+        }
+
+        $cache['models'] = $definitions;
+
+        $this->files->put(
+            '.blueprint',
+            $blueprint->dump($cache)
+        );
+
+        $this->info('Traced ' . count($definitions) . ' ' . Str::plural('model', count($definitions)));
     }
 
     private function appClasses()
@@ -98,12 +113,10 @@ class TraceCommand extends Command
         return $this->laravel->make($class);
     }
 
-    private function extractColumns($model)
+    private function extractColumns(Model $model)
     {
         $table = $model->getConnection()->getTablePrefix() . $model->getTable();
-        $schema = $model->getConnection()->getDoctrineSchemaManager($table);
-        $databasePlatform = $schema->getDatabasePlatform();
-//        $databasePlatform->registerDoctrineTypeMapping('enum', 'customEnum');
+        $schema = $model->getConnection()->getDoctrineSchemaManager();
 
         $database = null;
         if (strpos($table, '.')) {
@@ -113,24 +126,6 @@ class TraceCommand extends Command
         $columns = $schema->listTableColumns($table, $database);
 
         return $columns;
-//        if ($columns) {
-//            foreach ($columns as $column) {
-//                $name = $column->getName();
-//                if (in_array($name, $model->getDates())) {
-//                    $type = 'datetime';
-//                } else {
-//                    $type = $column->getType()->getName();
-//                }
-//                if (!($model->incrementing && $model->getKeyName() === $name) &&
-//                    $name !== $model::CREATED_AT &&
-//                    $name !== $model::UPDATED_AT
-//                ) {
-//                    if (!method_exists($model, 'getDeletedAtColumn') || (method_exists($model, 'getDeletedAtColumn') && $name !== $model->getDeletedAtColumn())) {
-//                        $this->setProperty($name, $type, $table);
-//                    }
-//                }
-//            }
-//        }
     }
 
     /**
@@ -138,9 +133,9 @@ class TraceCommand extends Command
      */
     private function mapColumns($columns)
     {
-        // TODO: handle special cases
-        // id, timestamps, softdeletes
-        return collect($columns)->map([self::class, 'columns'])->toArray();
+        return collect($columns)
+            ->map([self::class, 'columns'])
+            ->toArray();
     }
 
     public static function columns(\Doctrine\DBAL\Schema\Column $column, string $key)
@@ -160,10 +155,13 @@ class TraceCommand extends Command
             if ($column->getLength() !== 255) {
                 $type .= ':' . $column->getLength();
             }
+        } elseif ($type === 'text') {
+            if ($column->getLength() > 65535) {
+                $type = 'longtext';
+            }
         }
 
-        // update text types based on length...
-        // enums, guid, etc?
+        // TODO: enums, guid/uuid
 
         $attributes[] = $type;
 
@@ -173,6 +171,10 @@ class TraceCommand extends Command
 
         if (!$column->getNotnull()) {
             $attributes[] = 'nullable';
+        }
+
+        if ($column->getAutoincrement()) {
+            $attributes[] = 'autoincrement';
         }
 
         if (!is_null($column->getDefault())) {
@@ -186,17 +188,17 @@ class TraceCommand extends Command
     {
         static $mappings = [
             'array' => 'string',
-            'bigint' => 'bigInteger',
+            'bigint' => 'biginteger',
             'binary' => 'binary',
             'blob' => 'binary',
             'boolean' => 'boolean',
             'date' => 'date',
             'date_immutable' => 'date',
             'dateinterval' => 'date',
-            'datetime' => 'dateTime',
-            'datetime_immutable' => 'dateTime',
-            'datetimetz' => 'dateTimeTz',
-            'datetimetz_immutable' => 'dateTimeTz',
+            'datetime' => 'datetime',
+            'datetime_immutable' => 'datetime',
+            'datetimetz' => 'datetimetz',
+            'datetimetz_immutable' => 'datetimetz',
             'decimal' => 'decimal',
             'float' => 'float',
             'guid' => 'string',
@@ -204,7 +206,7 @@ class TraceCommand extends Command
             'json' => 'json',
             'object' => 'string',
             'simple_array' => 'string',
-            'smallint' => 'smallInteger',
+            'smallint' => 'smallinteger',
             'string' => 'string',
             'text' => 'text',
             'time' => 'time',
@@ -212,5 +214,31 @@ class TraceCommand extends Command
         ];
 
         return $mappings[$type] ?? 'string';
+    }
+
+    private function translateColumns(array $columns)
+    {
+        if (isset($columns['id']) && strpos($columns['id'], 'autoincrement') !== false && strpos($columns['id'], 'integer') !== false) {
+            unset($columns['id']);
+        }
+
+        if (isset($columns[Model::CREATED_AT]) && isset($columns[Model::UPDATED_AT])) {
+            if (strpos($columns[Model::CREATED_AT], 'datetimetz') !== false) {
+                $columns['timestampstz'] = 'timestampsTz';
+            }
+
+            unset($columns[Model::CREATED_AT]);
+            unset($columns[Model::UPDATED_AT]);
+        }
+
+        if (isset($columns['deleted_at'])) {
+            if (strpos($columns['deleted_at'], 'datetimetz') !== false) {
+                $columns['softdeletestz'] = 'softDeletesTz';
+            }
+
+            unset($columns['deleted_at']);
+        }
+
+        return $columns;
     }
 }
